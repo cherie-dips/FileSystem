@@ -1,0 +1,18 @@
+# build output
+build/
+
+# the plan — private working document
+plan.md
+
+# file system images and logs produced by running the tools
+*.img
+*.log
+disk.img
+wal.log
+
+# editor / OS noise
+.DS_Store
+compile_commands.json
+.cache/
+*.o
+*.d
