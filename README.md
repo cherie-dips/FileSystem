@@ -27,13 +27,16 @@ make run        # build and run the shell
 make clean      # delete every build directory
 ```
 
+Two binaries come out of it: `vfs_shell`, which you drive the file system with, and
+`disktest`, which checks that the layer built in stage 1 actually works.
+
 Each mode builds into its own directory, so switching between them never leaves stale
 object files behind.
 
 ```
 $ make
 $ ./build/release/vfs_shell --version
-ConcurrentFS 0.1 (stage 0 - skeleton)
+ConcurrentFS 0.1 (stage 1 - the fake disk)
 ```
 
 Running it with no arguments lists every command the file system will eventually have,
@@ -41,7 +44,7 @@ next to the stage that makes each one work:
 
 ```
 $ ./build/release/vfs_shell
-ConcurrentFS 0.1 (stage 0 - skeleton)
+ConcurrentFS 0.1 (stage 1 - the fake disk)
 
 usage: vfs_shell [--version] [--help] <command> [args]
 
@@ -64,12 +67,28 @@ $ ./build/release/vfs_shell mkfs
 vfs_shell: 'mkfs' is not built yet - it arrives at stage 2
 ```
 
+And the stage 1 checks:
+
+```
+$ ./build/release/disktest
+round trip within one process
+  ok    block_count reports what we asked for
+  ok    what goes in comes out
+bounds
+  ok    reading one past the last block is rejected
+  ...
+persistence across two processes
+  ok    block 500 survived the process exiting
+
+stage 1: all checks passed
+```
+
 ---
 
 ## What is being built
 
-Six layers. Each one only talks to the layer below it. Only the outermost shell exists
-today — the file names below are where each layer will go, not files that are there now.
+Six layers. Each one only talks to the layer below it. Layers 0 and 5 exist today; for the
+rest, the file names below are where each layer will go, not files that are there now.
 
 ```
 +-------------------------------------------------------------------+
@@ -83,11 +102,11 @@ today — the file names below are where each layer will go, not files that are 
 |  Layer 3  File system logic                                       |
 |           inodes, directories, path lookup, bitmaps               |
 |           + per-inode locks so threads stay out of each           |
-|             other's way                              <- stages 2-4, 9 |
+|             other's way                          <- stages 2-4, 9 |
 +-------------------------------------------------------------------+
 |  Layer 2  Write-ahead log                                         |
 |           every change is written to a log first, then applied    |
-|           src/wal.cpp, src/recovery.cpp              <- stages 7-8 |
+|           src/wal.cpp, src/recovery.cpp             <- stages 7-8 |
 +-------------------------------------------------------------------+
 |  Layer 1  Block cache                                             |
 |           keeps hot 4 KB blocks in RAM, writes dirty ones back    |
@@ -115,13 +134,17 @@ FileSystem/
 ├── .gitignore
 │
 ├── include/vfs/              # one header per module — what each module does
-│   └── version.h             # who we are, how far the build got
+│   ├── version.h             # who we are, how far the build got
+│   ├── layout.h              # BLOCK_SIZE, and the Block type
+│   └── block_device.h        # the disk: read_block / write_block / sync
 │
 ├── src/                      # library code, linked into every tool
-│   └── version.cpp           # how version.h does it
+│   ├── version.cpp
+│   └── block_device.cpp      # PreadDevice — the disk, over a real file
 │
 └── tools/                    # programs you run from the terminal
-    └── vfs_shell.cpp         # drives the file system
+    ├── vfs_shell.cpp         # drives the file system
+    └── disktest.cpp          # proves stage 1 works
 ```
 
 **Why `src/` and `tools/` are separate.** A file in `src/` is library code: compiled once
@@ -162,12 +185,85 @@ and all four modes compile clean with no warnings.
 
 ---
 
+## Stage 1 — the fake disk
+
+**The disk is a file.** `disk.img` is an ordinary file cut into 4096-byte blocks: block 37
+is the bytes at offset 37 × 4096. That is the whole idea. Everything built above this layer
+thinks in block numbers and never touches a file descriptor, which means there is exactly
+one place in the codebase where bytes reach the disk — and that will matter enormously at
+stage 7, when the write-ahead log needs to control the order writes happen in.
+
+Four operations, and nothing else:
+
+```cpp
+class BlockDevice {
+public:
+    virtual void read_block (uint32_t block_no, Block& dst)       = 0;
+    virtual void write_block(uint32_t block_no, const Block& src) = 0;
+    virtual void sync()                                           = 0;
+    virtual uint32_t block_count() const                          = 0;
+};
+```
+
+`PreadDevice` implements them over a real file with `pread`, `pwrite` and `fsync`. It is a
+dumb pass-through: every call goes straight to the file. Caching comes at stage 6 and sits
+*above* this layer, not inside it.
+
+### Decisions worth knowing about
+
+**`Block`, not `void*`.** `Block` is `std::array<uint8_t, 4096>`. The obvious signature is
+`read_block(uint32_t, void*)`, but that carries an unwritten promise that the caller
+allocated at least 4096 bytes. Break the promise and you get a silent 4 KB stack smash.
+With the size in the type, the compiler catches it:
+
+```
+error: non-const lvalue reference to type 'Block' cannot bind to a value of
+       unrelated type 'char[64]'
+```
+
+**`pread`/`pwrite`, not `mmap`.** Mapping the file into memory would make a read a plain
+`memcpy` and skip a system call. The problem is that a write to mapped memory only marks a
+page dirty; the OS copies it to the disk later, on its own schedule, and will not tell you
+when. The journal at stage 7 depends on holding a change back until its log record is safely
+down, and `mmap` gives no way to hold anything back. The system call it would have saved is
+one the stage 6 cache removes anyway.
+
+### The details that actually bite
+
+- **Offset overflow.** `block_no * BLOCK_SIZE` on a `uint32_t` wraps at block 1,048,576 —
+  a 4 GB disk — and silently corrupts block 0. The cast has to come first:
+  `static_cast<off_t>(block_no) * BLOCK_SIZE`.
+- **Short reads and writes.** `pread` is not obliged to move all 4096 bytes in one call, so
+  both helpers loop until the block is complete.
+- **`EINTR`.** A signal makes the call return `-1` without having failed. Retry, don't throw.
+  `read`, `write` and `sync` all handle it.
+- **`create()` refuses to overwrite.** `O_EXCL`, not `O_TRUNC` — creating a disk on top of a
+  file that already holds a file system should never happen by accident.
+- **`fsync` is not enough on macOS.** It pushes data to the drive but does not ask the drive
+  to persist its own cache. `sync()` tries `fcntl(fd, F_FULLFSYNC, 0)` first and falls back
+  to `fsync` where that is unsupported.
+- **`errno` is saved before `close()`** in the error paths, because `close` can overwrite it
+  and turn a real error message into a misleading one.
+
+Bad input is rejected rather than half-handled: a block number past the end, a file that
+is not a whole number of blocks, an empty file, a disk of zero blocks.
+
+### From the book
+
+- **Ch 36, "I/O Devices", p. 419** — why the unit of transfer is a block at all. 36.5 on
+  DMA (p. 424) is why it is a big one rather than a byte.
+- **Ch 37, "Hard Disk Drives", p. 433** — 37.4, "I/O Time: Doing The Math" (p. 438), is why
+  a real disk makes you care how many blocks you touch and where they are.
+- **39.7, "Writing Immediately With fsync()", p. 477** — two pages, and exactly why `sync()`
+  has to be a separate call from `write_block`.
+
+---
+
 ## What comes next
 
 | Stage | What gets built | From the book |
 |---|---|---|
-| **1** | The fake disk — one file, read and written 4 KB at a time | Ch 36 (p. 419), Ch 37 (p. 433), 39.7 (p. 477) |
-| 2 | Free-space bitmaps, and `mkfs` to format a disk | 40.5 (p. 501), Ch 17 (p. 167) |
+| **2** | Free-space bitmaps, and `mkfs` to format a disk | 40.5 (p. 501), Ch 17 (p. 167) |
 | 3 | Inodes, and direct / indirect / double-indirect block mapping | 40.3 (p. 496) |
 | 4 | Directories and path lookup | 40.4 (p. 501), 40.6 (p. 502) |
 | 5 | The public API, and the open file table | Ch 39 (p. 467), 39.6 (p. 475) |
@@ -180,4 +276,4 @@ and all four modes compile clean with no warnings.
 After stage 10, one extension: mounting the whole thing with FUSE so `ls`, `cat` and `vim`
 talk to it like any other folder (OSTEP 39.17, p. 488).
 
-Stage 1 is next, and this README grows to cover it when it lands.
+Stage 2 is next, and this README grows to cover it when it lands.
