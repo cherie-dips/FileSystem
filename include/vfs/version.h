@@ -11,7 +11,7 @@ namespace vfs {
     inline constexpr int kVersionMinor  = 1;
 
     // Bumped as each stage of the build plan lands.
-    inline constexpr const char* kStage = "stage 1 - the fake disk";
+    inline constexpr const char* kStage = "stage 2 - bitmaps and mkfs";
 
     // e.g. "ConcurrentFS 0.1 (stage 0 - skeleton)"
     // Returns by value: no shared buffer, so it is safe to call from any thread.

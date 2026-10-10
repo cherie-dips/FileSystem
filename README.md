@@ -27,8 +27,8 @@ make run        # build and run the shell
 make clean      # delete every build directory
 ```
 
-Two binaries come out of it: `vfs_shell`, which you drive the file system with, and
-`disktest`, which checks that the layer built in stage 1 actually works.
+Three binaries come out of it: `vfs_shell`, which you drive the file system with, and
+`disktest` and `mkfstest`, which check that stages 1 and 2 actually work.
 
 Each mode builds into its own directory, so switching between them never leaves stale
 object files behind.
@@ -36,7 +36,7 @@ object files behind.
 ```
 $ make
 $ ./build/release/vfs_shell --version
-ConcurrentFS 0.1 (stage 1 - the fake disk)
+ConcurrentFS 0.1 (stage 2 - bitmaps and mkfs)
 ```
 
 Running it with no arguments lists every command the file system will eventually have,
@@ -44,13 +44,13 @@ next to the stage that makes each one work:
 
 ```
 $ ./build/release/vfs_shell
-ConcurrentFS 0.1 (stage 1 - the fake disk)
+ConcurrentFS 0.1 (stage 2 - bitmaps and mkfs)
 
 usage: vfs_shell [--version] [--help] <command> [args]
 
 commands:
-  mkfs     format a new disk image              stage 2
-  dump     print a superblock, bitmap or inode  stage 2
+  mkfs     format a new disk image              ready
+  dump     print a superblock, bitmap or inode  ready
   mkdir    create a directory                   stage 4
   ls       list a directory                     stage 4
   cat      print a file                         stage 5
@@ -58,16 +58,49 @@ commands:
   rm       remove a file                        stage 5
   sync     flush everything to the disk image   stage 6
   fsck     check the disk image for damage      stage 8
+
+the ones that are ready:
+  vfs_shell mkfs <image> <size> [--inodes N]
+  vfs_shell dump <image> [--super] [--bitmaps] [--inode N]...
+
+sizes are in bytes, or end in K, M or G: 256M
 ```
 
-Asking for one of those today tells you where the build is rather than failing quietly:
+Asking for one that is not ready yet tells you where the build is rather than failing
+quietly:
 
 ```
-$ ./build/release/vfs_shell mkfs
-vfs_shell: 'mkfs' is not built yet - it arrives at stage 2
+$ ./build/release/vfs_shell mkdir /a
+vfs_shell: 'mkdir' is not built yet - it arrives at stage 4
 ```
 
-And the stage 1 checks:
+Making a disk and looking inside it:
+
+```
+$ ./build/release/vfs_shell mkfs disk.img 256M
+formatted disk.img
+  size         256 MB, 65536 blocks of 4096 bytes
+  inodes       4096
+  data blocks  65404, from block 132
+  root         inode 1, its directory in block 132
+
+$ ./build/release/vfs_shell dump disk.img --super
+superblock, block 0
+  magic                0x31534643 "CFS1"
+  block size           4096
+  total blocks         65536 (256 MB)
+  inodes               4096
+  inode bitmap         block 1
+  data bitmap          blocks 2-3 (2)
+  inode table          blocks 4-131 (128)
+  data                 blocks 132-65535 (65404)
+  root inode           1
+  clean unmount        yes
+  last checkpoint lsn  0
+  valid
+```
+
+And the checks for each stage so far:
 
 ```
 $ ./build/release/disktest
@@ -81,14 +114,28 @@ persistence across two processes
   ok    block 500 survived the process exiting
 
 stage 1: all checks passed
+
+$ ./build/release/mkfstest
+bitmap: single bits
+  ok    a new bitmap has every bit clear
+  ok    set and is_set agree at bits 0, 63, 64 and the last one
+  ...
+mkfs, on a disk full of junk
+  ok    the superblock reads back as mkfs wrote it
+  ok    inode bitmap: only inode 0 (reserved) and the root are in use
+  ...
+  ok    every other inode is zeroed, junk and all
+
+stage 2: all checks passed
 ```
 
 ---
 
 ## What is being built
 
-Six layers. Each one only talks to the layer below it. Layers 0 and 5 exist today; for the
-rest, the file names below are where each layer will go, not files that are there now.
+Six layers. Each one only talks to the layer below it. Layers 0 and 5 exist today, and
+layer 3 has its first pieces; for the rest, the file names below are where each layer will
+go, not files that are there now.
 
 ```
 +-------------------------------------------------------------------+
@@ -101,6 +148,7 @@ rest, the file names below are where each layer will go, not files that are ther
 +-------------------------------------------------------------------+
 |  Layer 3  File system logic                                       |
 |           inodes, directories, path lookup, bitmaps               |
+|           src/bitmap.cpp, src/superblock.cpp, src/mkfs.cpp        |
 |           + per-inode locks so threads stay out of each           |
 |             other's way                          <- stages 2-4, 9 |
 +-------------------------------------------------------------------+
@@ -135,22 +183,29 @@ FileSystem/
 │
 ├── include/vfs/              # one header per module — what each module does
 │   ├── version.h             # who we are, how far the build got
-│   ├── layout.h              # BLOCK_SIZE, and the Block type
-│   └── block_device.h        # the disk: read_block / write_block / sync
+│   ├── layout.h              # the bytes on disk: Superblock, Inode, DirEntry
+│   ├── block_device.h        # the disk: read_block / write_block / sync
+│   ├── bitmap.h              # set / clear / is_set / find_first_free
+│   ├── superblock.h          # plan the layout; read, check and write block 0
+│   └── mkfs.h                # format a disk
 │
 ├── src/                      # library code, linked into every tool
 │   ├── version.cpp
-│   └── block_device.cpp      # PreadDevice — the disk, over a real file
+│   ├── block_device.cpp      # PreadDevice — the disk, over a real file
+│   ├── bitmap.cpp
+│   ├── superblock.cpp
+│   └── mkfs.cpp
 │
 └── tools/                    # programs you run from the terminal
     ├── vfs_shell.cpp         # drives the file system
-    └── disktest.cpp          # proves stage 1 works
+    ├── disktest.cpp          # proves stage 1 works
+    └── mkfstest.cpp          # proves stage 2 works
 ```
 
 **Why `src/` and `tools/` are separate.** A file in `src/` is library code: compiled once
 and linked into every tool. A file in `tools/` has its own `main()` and becomes its own
-binary. The Makefile already treats them differently, so stage 2 can drop in `tools/mkfs.cpp`
-and get a second binary with no build change.
+binary. The Makefile already treats them differently, so a new program is one new file in
+`tools/` and no build change — which is all it took to add `mkfstest` at stage 2.
 
 **The rule this project follows:** a header in `include/vfs/` says *what* a module does;
 the matching `.cpp` in `src/` is the only file that knows *how*. If a future
@@ -259,12 +314,111 @@ is not a whole number of blocks, an empty file, a disk of zero blocks.
 
 ---
 
+## Stage 2 — bitmaps and `mkfs`
+
+**A bitmap is one bit per thing.** Bit 37 of the inode bitmap set means inode 37 is in use;
+bit 500 of the data bitmap set means block 500 is. Allocating is finding a clear bit and
+setting it, freeing is clearing it. Every inode is the same size and so is every block,
+which is why a bitmap is all this needs: the fragmentation that fills most of a chapter on
+`malloc` comes from allocating things of different sizes, and there are none here.
+
+`mkfs` turns an empty file into an empty file system. On a 256 MB disk:
+
+```
+ block:  0        1         2-3        4 ........ 131    132    133 ........ 65535
+       +--------+---------+---------+-----------------+------+------------------+
+       | super  | inode   | data    |  inode table    | root |  free data       |
+       | block  | bitmap  | bitmap  |  (4096 inodes)  | dir  |  blocks          |
+       +--------+---------+---------+-----------------+------+------------------+
+```
+
+In order, it:
+
+1. wipes block 0, and syncs;
+2. zeroes the inode table;
+3. writes the inode bitmap — inode 0 (reserved) and inode 1 (the root) in use;
+4. writes the data bitmap — every metadata block, and the root's directory block, in use;
+5. writes the root directory's block: `.` and `..`, both pointing at inode 1;
+6. writes inode 1: a directory, mode 0755, two links, one block;
+7. syncs, writes the superblock, and syncs again.
+
+`vfs_shell dump` reads it back: the superblock, the bitmaps as runs of used bits, or any one
+inode. It prints the superblock *before* checking it, then says what is wrong with it — a
+damaged superblock is exactly the one you want to look at.
+
+### Decisions worth knowing about
+
+**The layout is computed, not fixed.** How big each region is depends on the disk. One
+bitmap block covers 32,768 blocks, so 256 MB needs two of them; 4096 inodes at 32 per block
+is 128 blocks of inode table. `plan_layout()` works everything out from two numbers, the
+disk size and the inode count. Because nothing else goes in, `read_superblock()` can redo
+the sum from the two numbers in the superblock and compare region by region, so a
+superblock with one field off by one is turned away.
+
+**The root is inode 1, and inode 0 is never used.** A directory entry whose `inode_id` is 0
+is an empty slot. If the root were inode 0, its own `.` and `..` would read as empty. xv6
+makes the same choice for the same reason.
+
+**The data bitmap covers every block, metadata included.** Bit N is block N, with no offset
+to get wrong, and the metadata blocks are marked in use from the start, so no allocation
+can ever hand out the superblock or a piece of the inode table.
+
+**One inode per 16 blocks**, unless `--inodes N` says otherwise: one per 64 KB of disk, 4096
+on a 256 MB disk. Always rounded up to fill whole blocks of the inode table.
+
+**`Inode::size` is 64 bits.** Twelve direct pointers, one indirect and one double-indirect
+reach (12 + 1024 + 1024²) × 4 KB — just over 4 GB, which 32 bits cannot count to.
+
+**Lowest free block first.** `find_first_free()` returns the lowest clear bit. Once files
+start being deleted that scatters new files across the disk. 41.4 (p. 515) allocates near
+the file's inode instead, which would be a change to this one function; it is left for later.
+
+**The superblock goes on last.** If `mkfs` dies part way, the image has no magic number and
+nothing will take it for a file system. Block 0 is wiped and synced before anything else,
+so re-formatting an old image gets the same guarantee. A first, small taste of stage 7: the
+order bytes reach the disk decides what a crash leaves behind.
+
+### The details that actually bite
+
+- **The end of the bitmap.** A 100-bit map is one and a half 64-bit words. The other 28 bits
+  are clear but do not exist, and a full map would hand out bit 100 — an inode that is not
+  there — unless `find_first_free()` checks. Loading has the same edge: the disk block holds
+  32,768 bits, the map uses 100, and whatever the disk says about the rest is dropped.
+- **"Nothing free" needs its own answer.** `find_first_free()` returns
+  `std::optional<uint32_t>`, not an `int` with -1 for full, so every block number can be an
+  answer.
+- **Rounding up past 2³².** `--inodes 4294967295` rounds up to 2³², which in a `uint32_t` is
+  0. The layout is worked out in 64 bits, and that is rejected rather than wrapped.
+- **Hidden padding.** An odd number of `uint32_t` fields followed by a `uint64_t` leaves a
+  4-byte gap, which holds whatever was on the stack, and `memcpy` would put that on the
+  disk. `std::has_unique_object_representations` fails the build if any on-disk struct has
+  a gap — which is why `clean_unmount` is a `uint32_t` and not a lone byte.
+- **Byte order.** Structs go to disk exactly as they sit in memory, so the format is
+  little-endian. A `static_assert` refuses to build anywhere else, rather than write images
+  no other build can read.
+- **Zeroed, not assumed zero.** A new file is all zeros, but `mkfs()` takes any
+  `BlockDevice`, and on a reused one a leftover inode would look live. `mkfstest` formats a
+  disk full of `0xAB` to prove the inode table really is wiped.
+
+`vfs_shell mkfs` will not overwrite an existing file (stage 1's `O_EXCL`), checks the layout
+fits before creating anything, and deletes its own file if formatting fails part way.
+
+### From the book
+
+- **40.2, "Overall Organization", p. 494** — the picture above, sized for this disk.
+- **40.5, "Free Space Management", p. 501** — the bitmap, in two paragraphs.
+- **Ch 17, "Free-Space Management", p. 167** — the full treatment, and why the fragmentation
+  it spends most of its pages on cannot happen when every allocation is the same size.
+- **40.3, p. 496** and **40.4, p. 501** — the inode and the directory entry that `mkfs`
+  writes for the root, ahead of stages 3 and 4 giving them something to do.
+
+---
+
 ## What comes next
 
 | Stage | What gets built | From the book |
 |---|---|---|
-| **2** | Free-space bitmaps, and `mkfs` to format a disk | 40.5 (p. 501), Ch 17 (p. 167) |
-| 3 | Inodes, and direct / indirect / double-indirect block mapping | 40.3 (p. 496) |
+| **3** | Inodes, and direct / indirect / double-indirect block mapping | 40.3 (p. 496) |
 | 4 | Directories and path lookup | 40.4 (p. 501), 40.6 (p. 502) |
 | 5 | The public API, and the open file table | Ch 39 (p. 467), 39.6 (p. 475) |
 | 6 | The block cache — LRU, dirty bits, pinning | 40.7 (p. 506), Ch 22 (p. 243) |
@@ -276,4 +430,4 @@ is not a whole number of blocks, an empty file, a disk of zero blocks.
 After stage 10, one extension: mounting the whole thing with FUSE so `ls`, `cat` and `vim`
 talk to it like any other folder (OSTEP 39.17, p. 488).
 
-Stage 2 is next, and this README grows to cover it when it lands.
+Stage 3 is next, and this README grows to cover it when it lands.
