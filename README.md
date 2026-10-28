@@ -1,433 +1,258 @@
-# ConcurrentFS — a file system built from scratch, in user space
+# ConcurrentFS
 
-A file system written in C++ that stores everything inside one ordinary file on your
-laptop. It will have its own inodes, its own free-space bitmaps, its own directories, its
-own block cache, and its own write-ahead log so it survives being killed in the middle of
-a write. Many threads will be able to use it at once.
+A file system written from scratch in C++17 that lives inside one ordinary file. It has its
+own inodes, free-space bitmaps, directories, block cache, write-ahead log and crash
+recovery. Many threads can use it at once, and it survives being killed in the middle of a
+write.
 
-Nothing here wraps the file system your OS already has. Every piece is built by hand.
+Nothing wraps the host file system. The only calls it makes to the OS are `pread`, `pwrite`
+and `fsync`, on two files: the disk image and its log.
 
-The book behind this project is *Operating Systems: Three Easy Pieces*. Each stage below
-says which chapter and page it comes from.
-
-
----
-
-## Build and run
-
-Needs a C++17 compiler and `make`. Both come with the Xcode command line tools on macOS
-(`xcode-select --install`). No other dependencies.
-
-```
-make            # build, optimised                -> build/release/
-make debug      # no optimisation, debug symbols  -> build/debug/
-make asan       # + AddressSanitizer and UBSan    -> build/asan/
-make tsan       # + ThreadSanitizer               -> build/tsan/
-make run        # build and run the shell
-make clean      # delete every build directory
-```
-
-Three binaries come out of it: `vfs_shell`, which you drive the file system with, and
-`disktest` and `mkfstest`, which check that stages 1 and 2 actually work.
-
-Each mode builds into its own directory, so switching between them never leaves stale
-object files behind.
-
-```
-$ make
-$ ./build/release/vfs_shell --version
-ConcurrentFS 0.1 (stage 2 - bitmaps and mkfs)
-```
-
-Running it with no arguments lists every command the file system will eventually have,
-next to the stage that makes each one work:
-
-```
-$ ./build/release/vfs_shell
-ConcurrentFS 0.1 (stage 2 - bitmaps and mkfs)
-
-usage: vfs_shell [--version] [--help] <command> [args]
-
-commands:
-  mkfs     format a new disk image              ready
-  dump     print a superblock, bitmap or inode  ready
-  mkdir    create a directory                   stage 4
-  ls       list a directory                     stage 4
-  cat      print a file                         stage 5
-  write    write text into a file               stage 5
-  rm       remove a file                        stage 5
-  sync     flush everything to the disk image   stage 6
-  fsck     check the disk image for damage      stage 8
-
-the ones that are ready:
-  vfs_shell mkfs <image> <size> [--inodes N]
-  vfs_shell dump <image> [--super] [--bitmaps] [--inode N]...
-
-sizes are in bytes, or end in K, M or G: 256M
-```
-
-Asking for one that is not ready yet tells you where the build is rather than failing
-quietly:
-
-```
-$ ./build/release/vfs_shell mkdir /a
-vfs_shell: 'mkdir' is not built yet - it arrives at stage 4
-```
-
-Making a disk and looking inside it:
-
-```
-$ ./build/release/vfs_shell mkfs disk.img 256M
-formatted disk.img
-  size         256 MB, 65536 blocks of 4096 bytes
-  inodes       4096
-  data blocks  65404, from block 132
-  root         inode 1, its directory in block 132
-
-$ ./build/release/vfs_shell dump disk.img --super
-superblock, block 0
-  magic                0x31534643 "CFS1"
-  block size           4096
-  total blocks         65536 (256 MB)
-  inodes               4096
-  inode bitmap         block 1
-  data bitmap          blocks 2-3 (2)
-  inode table          blocks 4-131 (128)
-  data                 blocks 132-65535 (65404)
-  root inode           1
-  clean unmount        yes
-  last checkpoint lsn  0
-  valid
-```
-
-And the checks for each stage so far:
-
-```
-$ ./build/release/disktest
-round trip within one process
-  ok    block_count reports what we asked for
-  ok    what goes in comes out
-bounds
-  ok    reading one past the last block is rejected
-  ...
-persistence across two processes
-  ok    block 500 survived the process exiting
-
-stage 1: all checks passed
-
-$ ./build/release/mkfstest
-bitmap: single bits
-  ok    a new bitmap has every bit clear
-  ok    set and is_set agree at bits 0, 63, 64 and the last one
-  ...
-mkfs, on a disk full of junk
-  ok    the superblock reads back as mkfs wrote it
-  ok    inode bitmap: only inode 0 (reserved) and the root are in use
-  ...
-  ok    every other inode is zeroed, junk and all
-
-stage 2: all checks passed
-```
+Built stage by stage from *Operating Systems: Three Easy Pieces* (OSTEP).
 
 ---
 
-## What is being built
+## Build and test
 
-Six layers. Each one only talks to the layer below it. Layers 0 and 5 exist today, and
-layer 3 has its first pieces; for the rest, the file names below are where each layer will
-go, not files that are there now.
+Needs a C++17 compiler and `make`; on macOS, `xcode-select --install`. Nothing else.
 
 ```
-+-------------------------------------------------------------------+
-|  Layer 5  Test programs, a small shell, benchmarks                |
-|           tools/vfs_shell.cpp                          <- stage 0 |
-+-------------------------------------------------------------------+
-|  Layer 4  The public API                                          |
-|           vfs_open, vfs_read, vfs_write, vfs_mkdir ...            |
-|           include/vfs/vfs.h, src/vfs.cpp               <- stage 5 |
-+-------------------------------------------------------------------+
-|  Layer 3  File system logic                                       |
-|           inodes, directories, path lookup, bitmaps               |
-|           src/bitmap.cpp, src/superblock.cpp, src/mkfs.cpp        |
-|           + per-inode locks so threads stay out of each           |
-|             other's way                          <- stages 2-4, 9 |
-+-------------------------------------------------------------------+
-|  Layer 2  Write-ahead log                                         |
-|           every change is written to a log first, then applied    |
-|           src/wal.cpp, src/recovery.cpp             <- stages 7-8 |
-+-------------------------------------------------------------------+
-|  Layer 1  Block cache                                             |
-|           keeps hot 4 KB blocks in RAM, writes dirty ones back    |
-|           src/buffer_cache.cpp, src/flusher.cpp        <- stage 6 |
-+-------------------------------------------------------------------+
-|  Layer 0  The fake disk                                           |
-|           one big file, read and written 4 KB at a time           |
-|           src/block_device.cpp                         <- stage 1 |
-+-------------------------------------------------------------------+
+make                  # build                         -> build/release/
+make test             # run all 11 test programs
+make MODE=asan test   # the same under AddressSanitizer + UBSan
+make MODE=tsan test   # the same under ThreadSanitizer
+make bench            # benchmarks
 ```
 
-The "disk" will be a file called `disk.img`. A 256 MB one is a 256 MB disk with 65,536
-blocks of 4 KB each. Deleting the file wipes the file system; copying it clones it.
-
----
-
-## Project structure
-
-Everything that exists today. Each stage adds its own files; nothing is here in advance.
+## Use it
 
 ```
-FileSystem/
-├── Makefile                  # four build modes, one directory each
-├── README.md
-├── .gitignore
-│
-├── include/vfs/              # one header per module — what each module does
-│   ├── version.h             # who we are, how far the build got
-│   ├── layout.h              # the bytes on disk: Superblock, Inode, DirEntry
-│   ├── block_device.h        # the disk: read_block / write_block / sync
-│   ├── bitmap.h              # set / clear / is_set / find_first_free
-│   ├── superblock.h          # plan the layout; read, check and write block 0
-│   └── mkfs.h                # format a disk
-│
-├── src/                      # library code, linked into every tool
-│   ├── version.cpp
-│   ├── block_device.cpp      # PreadDevice — the disk, over a real file
-│   ├── bitmap.cpp
-│   ├── superblock.cpp
-│   └── mkfs.cpp
-│
-└── tools/                    # programs you run from the terminal
-    ├── vfs_shell.cpp         # drives the file system
-    ├── disktest.cpp          # proves stage 1 works
-    └── mkfstest.cpp          # proves stage 2 works
+$ vfs_shell mkfs disk.img 256M
+$ vfs_shell mkdir disk.img -p /notes/2026
+$ vfs_shell write disk.img /notes/2026/todo.txt finish the file system
+$ vfs_shell ls disk.img /notes/2026
+todo.txt
+$ vfs_shell cat disk.img /notes/2026/todo.txt
+finish the file system
+$ vfs_shell fsck disk.img
+disk.img: clean (files 1, directories 3, inodes in use 4, blocks in use 136)
 ```
 
-**Why `src/` and `tools/` are separate.** A file in `src/` is library code: compiled once
-and linked into every tool. A file in `tools/` has its own `main()` and becomes its own
-binary. The Makefile already treats them differently, so a new program is one new file in
-`tools/` and no build change — which is all it took to add `mkfstest` at stage 2.
+Commands: `mkfs dump mkdir ls cat write rm sync fsck` — run `vfs_shell` for their arguments.
+The log of `disk.img` is `disk.img.log`.
 
-**The rule this project follows:** a header in `include/vfs/` says *what* a module does;
-the matching `.cpp` in `src/` is the only file that knows *how*. If a future
-`directory.cpp` ever calls `pread` directly, something has gone wrong — it should be asking
-the buffer cache.
-
----
-
-## Stage 0 — the skeleton
-A build system, the directory layout, and a program that runs.
-
-There is no operating systems content in this stage and no chapter of the book behind it.
-That is the point: get the boring parts settled while they are cheap, so that from stage 1
-onward every change is about the file system and never about the build.
-
-What it sets up, and why each piece matters later:
-
-- **Four build modes in separate directories.** ThreadSanitizer becomes non-negotiable at
-  stage 9, and AddressSanitizer is useful from stage 2. Sanitizer builds need different
-  compiler flags, and mixing objects built with and without those flags produces confusing
-  failures. Separate directories per mode make that impossible.
-- **`-Wall -Wextra -Wpedantic`, on from the first line of code.** Cheaper than debugging.
-- **Automatic header dependency tracking** (`-MMD -MP`), so editing a header rebuilds
-  everything that included it. Easy to add now, annoying to add once there are thirty files.
-- **`vfs_shell` lists every future command with its stage.** It doubles as a progress
-  tracker: the plan is visible from the terminal, not only from this file. It is also the
-  only place stage 0 mentions later stages — no empty files or directories are created in
-  advance, so the tree always shows exactly what has been built.
-
-**Deliverable, met:** `make && ./build/release/vfs_shell --version` prints a version string,
-and all four modes compile clean with no warnings.
-
----
-
-## Stage 1 — the fake disk
-
-**The disk is a file.** `disk.img` is an ordinary file cut into 4096-byte blocks: block 37
-is the bytes at offset 37 × 4096. That is the whole idea. Everything built above this layer
-thinks in block numbers and never touches a file descriptor, which means there is exactly
-one place in the codebase where bytes reach the disk — and that will matter enormously at
-stage 7, when the write-ahead log needs to control the order writes happen in.
-
-Four operations, and nothing else:
+From C++, include `vfs/vfs.h`. Every call returns `>= 0`, or `-VFS_Exxx` (`errors.h`), and
+is safe from any number of threads:
 
 ```cpp
-class BlockDevice {
-public:
-    virtual void read_block (uint32_t block_no, Block& dst)       = 0;
-    virtual void write_block(uint32_t block_no, const Block& src) = 0;
-    virtual void sync()                                           = 0;
-    virtual uint32_t block_count() const                          = 0;
-};
+vfs_mount("disk.img", "disk.img.log");
+int fd = vfs_open("/hello.txt", VFS_O_CREAT | VFS_O_WRONLY);
+vfs_write(fd, "hi\n", 3);
+vfs_fsync(fd);              // durable from here on
+vfs_close(fd);
+vfs_unmount();
 ```
-
-`PreadDevice` implements them over a real file with `pread`, `pwrite` and `fsync`. It is a
-dumb pass-through: every call goes straight to the file. Caching comes at stage 6 and sits
-*above* this layer, not inside it.
-
-### Decisions worth knowing about
-
-**`Block`, not `void*`.** `Block` is `std::array<uint8_t, 4096>`. The obvious signature is
-`read_block(uint32_t, void*)`, but that carries an unwritten promise that the caller
-allocated at least 4096 bytes. Break the promise and you get a silent 4 KB stack smash.
-With the size in the type, the compiler catches it:
-
-```
-error: non-const lvalue reference to type 'Block' cannot bind to a value of
-       unrelated type 'char[64]'
-```
-
-**`pread`/`pwrite`, not `mmap`.** Mapping the file into memory would make a read a plain
-`memcpy` and skip a system call. The problem is that a write to mapped memory only marks a
-page dirty; the OS copies it to the disk later, on its own schedule, and will not tell you
-when. The journal at stage 7 depends on holding a change back until its log record is safely
-down, and `mmap` gives no way to hold anything back. The system call it would have saved is
-one the stage 6 cache removes anyway.
-
-### The details that actually bite
-
-- **Offset overflow.** `block_no * BLOCK_SIZE` on a `uint32_t` wraps at block 1,048,576 —
-  a 4 GB disk — and silently corrupts block 0. The cast has to come first:
-  `static_cast<off_t>(block_no) * BLOCK_SIZE`.
-- **Short reads and writes.** `pread` is not obliged to move all 4096 bytes in one call, so
-  both helpers loop until the block is complete.
-- **`EINTR`.** A signal makes the call return `-1` without having failed. Retry, don't throw.
-  `read`, `write` and `sync` all handle it.
-- **`create()` refuses to overwrite.** `O_EXCL`, not `O_TRUNC` — creating a disk on top of a
-  file that already holds a file system should never happen by accident.
-- **`fsync` is not enough on macOS.** It pushes data to the drive but does not ask the drive
-  to persist its own cache. `sync()` tries `fcntl(fd, F_FULLFSYNC, 0)` first and falls back
-  to `fsync` where that is unsupported.
-- **`errno` is saved before `close()`** in the error paths, because `close` can overwrite it
-  and turn a real error message into a misleading one.
-
-Bad input is rejected rather than half-handled: a block number past the end, a file that
-is not a whole number of blocks, an empty file, a disk of zero blocks.
-
-### From the book
-
-- **Ch 36, "I/O Devices", p. 419** — why the unit of transfer is a block at all. 36.5 on
-  DMA (p. 424) is why it is a big one rather than a byte.
-- **Ch 37, "Hard Disk Drives", p. 433** — 37.4, "I/O Time: Doing The Math" (p. 438), is why
-  a real disk makes you care how many blocks you touch and where they are.
-- **39.7, "Writing Immediately With fsync()", p. 477** — two pages, and exactly why `sync()`
-  has to be a separate call from `write_block`.
 
 ---
 
-## Stage 2 — bitmaps and `mkfs`
-
-**A bitmap is one bit per thing.** Bit 37 of the inode bitmap set means inode 37 is in use;
-bit 500 of the data bitmap set means block 500 is. Allocating is finding a clear bit and
-setting it, freeing is clearing it. Every inode is the same size and so is every block,
-which is why a bitmap is all this needs: the fragmentation that fills most of a chapter on
-`malloc` comes from allocating things of different sizes, and there are none here.
-
-`mkfs` turns an empty file into an empty file system. On a 256 MB disk:
+## The pipeline
 
 ```
- block:  0        1         2-3        4 ........ 131    132    133 ........ 65535
-       +--------+---------+---------+-----------------+------+------------------+
-       | super  | inode   | data    |  inode table    | root |  free data       |
-       | block  | bitmap  | bitmap  |  (4096 inodes)  | dir  |  blocks          |
-       +--------+---------+---------+-----------------+------+------------------+
+   your program  /  vfs_shell
+         │  vfs_open  vfs_read  vfs_write  vfs_mkdir  vfs_unlink  vfs_fsync ...
+         ▼
+ ┌─ API ──────────── open file table, per-inode reader/writer locks     vfs.cpp, lock_manager.cpp
+ ├─ File system ──── path → directory → inode → block map → allocator   path, directory, inode_table,
+ │                                                                       block_map, alloc
+ ├─ Journal ──────── groups operations into transactions                storage.cpp
+ ├─ Block cache ──── 4 KB frames, 16 shards, LRU, dirty bits, no-steal  buffer_cache.cpp
+ ├─ Write-ahead log  disk.img.log: BEGIN, full block images, COMMIT     wal.cpp, crc32.cpp
+ └─ Disk ─────────── disk.img, read and written 4 KB at a time          block_device.cpp
+
+   + a flusher thread: commits every second and writes dirty blocks back   flusher.cpp
 ```
 
-In order, it:
+Each layer talks only to the one below it, and exactly one file (`block_device.cpp`)
+touches `disk.img`.
 
-1. wipes block 0, and syncs;
-2. zeroes the inode table;
-3. writes the inode bitmap — inode 0 (reserved) and inode 1 (the root) in use;
-4. writes the data bitmap — every metadata block, and the root's directory block, in use;
-5. writes the root directory's block: `.` and `..`, both pointing at inode 1;
-6. writes inode 1: a directory, mode 0755, two links, one block;
-7. syncs, writes the superblock, and syncs again.
+### A write, start to finish
 
-`vfs_shell dump` reads it back: the superblock, the bitmaps as runs of used bits, or any one
-inode. It prints the superblock *before* checking it, then says what is wrong with it — a
-damaged superblock is exactly the one you want to look at.
+1. `vfs_write` cuts the data into chunks of up to 16 blocks. Each chunk is one operation.
+2. It locks the file exclusively, maps each file offset to a disk block, and allocates
+   blocks (and indirect blocks) from the bitmap where there are none yet.
+3. Every block it changes is changed in the cache, joins the running transaction, and is
+   pinned there. It cannot reach `disk.img` yet.
+4. **Commit** — on `vfs_fsync`, every second, or when the transaction is full: full copies
+   of all its blocks go to the log, then `fsync`, then a COMMIT record, then `fsync` again.
+   Operations running at the same time share one commit.
+5. **Write-back** — the flusher, cache eviction or a checkpoint copies blocks to
+   `disk.img`, but never a block whose COMMIT is not yet safely in the log.
+6. **Checkpoint** — when the log passes 32 MB, on `vfs_sync` and on unmount: write
+   everything back, sync, record it in the superblock, empty the log.
 
-### Decisions worth knowing about
+### Mounting after a crash
 
-**The layout is computed, not fixed.** How big each region is depends on the disk. One
-bitmap block covers 32,768 blocks, so 256 MB needs two of them; 4096 inodes at 32 per block
-is 128 blocks of inode table. `plan_layout()` works everything out from two numbers, the
-disk size and the inode count. Because nothing else goes in, `read_superblock()` can redo
-the sum from the two numbers in the superblock and compare region by region, so a
-superblock with one field off by one is turned away.
+The superblock says the last unmount was not clean, so before anything else:
 
-**The root is inode 1, and inode 0 is never used.** A directory entry whose `inode_id` is 0
-is an empty slot. If the root were inode 0, its own `.` and `..` would read as empty. xv6
-makes the same choice for the same reason.
+1. read the log from the start, stopping at the first torn or corrupt record (CRC32);
+2. write every block of every *committed* transaction to `disk.img`, in order;
+3. sync, and empty the log.
 
-**The data bitmap covers every block, metadata included.** Bit N is block N, with no offset
-to get wrong, and the metadata blocks are marked in use from the start, so no allocation
-can ever hand out the superblock or a piece of the inode table.
-
-**One inode per 16 blocks**, unless `--inodes N` says otherwise: one per 64 KB of disk, 4096
-on a 256 MB disk. Always rounded up to fill whole blocks of the inode table.
-
-**`Inode::size` is 64 bits.** Twelve direct pointers, one indirect and one double-indirect
-reach (12 + 1024 + 1024²) × 4 KB — just over 4 GB, which 32 bits cannot count to.
-
-**Lowest free block first.** `find_first_free()` returns the lowest clear bit. Once files
-start being deleted that scatters new files across the disk. 41.4 (p. 515) allocates near
-the file's inode instead, which would be a change to this one function; it is left for later.
-
-**The superblock goes on last.** If `mkfs` dies part way, the image has no magic number and
-nothing will take it for a file system. Block 0 is wiped and synced before anything else,
-so re-formatting an old image gets the same guarantee. A first, small taste of stage 7: the
-order bytes reach the disk decides what a crash leaves behind.
-
-### The details that actually bite
-
-- **The end of the bitmap.** A 100-bit map is one and a half 64-bit words. The other 28 bits
-  are clear but do not exist, and a full map would hand out bit 100 — an inode that is not
-  there — unless `find_first_free()` checks. Loading has the same edge: the disk block holds
-  32,768 bits, the map uses 100, and whatever the disk says about the rest is dropped.
-- **"Nothing free" needs its own answer.** `find_first_free()` returns
-  `std::optional<uint32_t>`, not an `int` with -1 for full, so every block number can be an
-  answer.
-- **Rounding up past 2³².** `--inodes 4294967295` rounds up to 2³², which in a `uint32_t` is
-  0. The layout is worked out in 64 bits, and that is rejected rather than wrapped.
-- **Hidden padding.** An odd number of `uint32_t` fields followed by a `uint64_t` leaves a
-  4-byte gap, which holds whatever was on the stack, and `memcpy` would put that on the
-  disk. `std::has_unique_object_representations` fails the build if any on-disk struct has
-  a gap — which is why `clean_unmount` is a `uint32_t` and not a lone byte.
-- **Byte order.** Structs go to disk exactly as they sit in memory, so the format is
-  little-endian. A `static_assert` refuses to build anywhere else, rather than write images
-  no other build can read.
-- **Zeroed, not assumed zero.** A new file is all zeros, but `mkfs()` takes any
-  `BlockDevice`, and on a reused one a leftover inode would look live. `mkfstest` formats a
-  disk full of `0xAB` to prove the inode table really is wiped.
-
-`vfs_shell mkfs` will not overwrite an existing file (stage 1's `O_EXCL`), checks the layout
-fits before creating anything, and deletes its own file if formatting fails part way.
-
-### From the book
-
-- **40.2, "Overall Organization", p. 494** — the picture above, sized for this disk.
-- **40.5, "Free Space Management", p. 501** — the bitmap, in two paragraphs.
-- **Ch 17, "Free-Space Management", p. 167** — the full treatment, and why the fragmentation
-  it spends most of its pages on cannot happen when every allocation is the same size.
-- **40.3, p. 496** and **40.4, p. 501** — the inode and the directory entry that `mkfs`
-  writes for the root, ahead of stages 3 and 4 giving them something to do.
+Transactions without a COMMIT are dropped. Their blocks never reached `disk.img` (step 3
+above), so there is nothing to undo: recovery is redo-only.
 
 ---
 
-## What comes next
+## On disk
 
-| Stage | What gets built | From the book |
+`disk.img`, at 256 MB:
+
+```
+ block   0           1           2-3          4-131            132-65535
+      ┌───────────┬───────────┬────────────┬───────────────┬─────────────────────┐
+      │ super-    │ inode     │ data       │ inode table   │ data blocks         │
+      │ block     │ bitmap    │ bitmap     │ 4096 inodes   │ (root dir in 132)   │
+      └───────────┴───────────┴────────────┴───────────────┴─────────────────────┘
+```
+
+- **Superblock** — magic `CFS1`, where each region starts, a clean-unmount flag, and the
+  log sequence number of the last checkpoint. Region sizes are worked out from the disk
+  size.
+- **Inode**, 128 bytes — type, link count, size, 12 direct block pointers, one
+  single-indirect and one double-indirect: files up to about 4 GB.
+- **Directory entry**, 64 bytes — inode number, type, a name of up to 58 bytes. The root is
+  inode 1; an entry holding inode 0 is an empty slot.
+
+`disk.img.log` — a sequence of records, each a 40-byte header (magic `WALR`, type BEGIN /
+BLOCK / COMMIT, block number, sequence number, transaction id, CRC32), followed, for a
+BLOCK record, by the block's full new 4 KB.
+
+The exact rules a consistent image follows are written at the bottom of
+`include/vfs/layout.h`; `fsck` checks every one.
+
+---
+
+## Concurrency
+
+- **One reader/writer lock per inode**, made when needed and dropped when unused. Reads of
+  a file share it, writes take it alone; two different files never wait for each other.
+- **Path lookup is hand-over-hand**, top-down: lock a directory, find the name, lock the
+  child, let go of the directory.
+- **One fixed lock order**, which rules out deadlock:
+  `descriptor → begin_op → inode locks (parent before child) → allocator → cache → journal`.
+  No inode lock is ever held across a commit or a disk write.
+- **Group commit**: every operation running when a commit starts goes into it, so sixteen
+  threads calling `fsync` share one pair of log syncs.
+- **The flusher** is OSTEP's producer/consumer: writers make dirty blocks, and it waits on a
+  condition variable with a timeout and writes them back.
+
+---
+
+## Tests
+
+| program | proves |
+|---|---|
+| `disktest` | blocks reach the file and survive the process exiting |
+| `mkfstest` | bitmaps, the layout, and that a fresh image holds exactly what it should |
+| `inodetest` | block mapping at every boundary (blocks 11/12, 1035/1036); one byte at offset 5,000,000 |
+| `dirtest` | directories and their errors; a cold `/foo/bar` lookup costs 3 disk reads, a warm one 0 (OSTEP Fig. 40.3) |
+| `vfstest` | a 10 MB file read back byte for byte; 4,000 random operations checked against an in-memory model |
+| `cachetest` | LRU, write-back, no-steal, the write-ahead rule |
+| `waltest` | every log record reads back in order; torn and corrupt records are cut off |
+| `journaltest` | killed at every write of a workload: each transaction is all or nothing |
+| `fscktest` | `fsck` names each of 24 kinds of damage |
+| `crashtest` | **killed at 500 points (100 of them during recovery too): `fsck` clean every time, and the files are exactly what some prefix of the operations left** |
+| `concurrenttest` | **16 threads, 5 s (`--seconds 60` for the long run): no lost or mixed-up data, zero ThreadSanitizer reports** |
+
+---
+
+## Benchmarks
+
+`make bench`, on an Apple Silicon MacBook, one run; expect ±20% between runs. `fsync` is
+off unless a row says otherwise. "Disk latency" is a sleep added to every disk write call,
+to imitate a slow disk.
+
+**The cache absorbs writes.** 16 MB written sequentially, disk latency 200 µs:
+
+| cache | write | write + sync |
 |---|---|---|
-| **3** | Inodes, and direct / indirect / double-indirect block mapping | 40.3 (p. 496) |
-| 4 | Directories and path lookup | 40.4 (p. 501), 40.6 (p. 502) |
-| 5 | The public API, and the open file table | Ch 39 (p. 467), 39.6 (p. 475) |
-| 6 | The block cache — LRU, dirty bits, pinning | 40.7 (p. 506), Ch 22 (p. 243) |
-| 7 | The write-ahead log | 42.1 (p. 526), 42.3 (p. 531) |
-| 8 | Crash recovery, `fsck`, and killing the process 500 times | 42.2 (p. 529), Ch 45 (p. 587) |
-| 9 | Many threads: per-inode locks, lock ordering, a flusher thread | Ch 28–30, Ch 32 (p. 385) |
-| 10 | Benchmarks, design write-up, polish | — |
+| 1 MB | 68 MB/s | 66 MB/s |
+| 64 MB | 3,256 MB/s | 917 MB/s |
 
-After stage 10, one extension: mounting the whole thing with FUSE so `ls`, `cat` and `vim`
-talk to it like any other folder (OSTEP 39.17, p. 488).
+With a big cache, writes return at memory speed and the cost moves to `vfs_sync`, where
+neighbouring blocks go out together in one write.
 
-Stage 3 is next, and this README grows to cover it when it lands.
+**The hit rate is what theory predicts.** Random 4 KB reads over a 32 MB file:
+
+| cache | disk reads per read | predicted (1 − cache / file) | reads/s |
+|---|---|---|---|
+| 1 MB | 0.969 | 0.969 | 14,877 |
+| 4 MB | 0.877 | 0.875 | 16,050 |
+| 16 MB | 0.500 | 0.500 | 28,160 |
+| 64 MB | 0.000 | 0.000 | 1,812,340 |
+
+**Threads.** 4 KB writes, 64 MB cache, operations per second:
+
+| threads | different files | same file | different files, `fsync` after each (fsync on) |
+|---|---|---|---|
+| 1 | 3.85 M | 3.75 M | 131 |
+| 4 | 5.05 M | 0.95 M | 378 |
+| 16 | 2.94 M | 0.16 M | 661 |
+
+Different files share no lock, so throughput holds as threads are added (this machine has 4
+fast cores). One file takes one writer at a time, so it does not scale, by design. Durable
+writes scale 5×, because one commit serves many threads' `fsync`s.
+
+**The cost of the log.** Everything is synced into `disk.img` before the clock stops:
+
+| workload | log off | log on |
+|---|---|---|
+| 16 MB sequential write | 1,958 MB/s | 1,450 MB/s |
+| 1,000 file creates | 206,840 /s | 156,835 /s |
+| 100 creates, `fsync` after each (fsync on) | 261 /s | 130 /s |
+
+Every block is written twice, once to the log and once to its home, and each `fsync`
+waits for two log syncs instead of one.
+
+---
+
+## Design decisions
+
+- **`pread`/`pwrite`, not `mmap`.** The log has to decide when a block may reach the disk.
+  With `mmap` the OS writes a changed page back whenever it likes.
+- **Redo-only log, no-steal cache.** Uncommitted changes never reach `disk.img`, so recovery
+  never has to undo anything. This is ext3's choice, and a few hundred lines instead of ARIES.
+- **Whole blocks in the log.** Wasteful, but replaying a record twice is harmless, and
+  recovery cannot always know whether it already did.
+- **File data is logged too**, not only metadata, so after a crash a file never contains
+  blocks of garbage.
+- **Lowest free block first.** Simple and clearly correct; OSTEP 41.4 has the faster policy.
+- **`F_FULLFSYNC` on macOS**, where plain `fsync` does not force the drive's own cache.
+
+## Limits
+
+- One mounted file system per process. No hard links, symlinks or rename; permissions are
+  fixed at 0644 for files and 0755 for directories.
+- A file that is open cannot be unlinked (`VFS_EBUSY`).
+- A single `vfs_write` of more than 16 blocks is several transactions, so a crash can keep
+  the first part of it (POSIX allows this).
+- Directories never shrink.
+- It is not mounted into the OS. FUSE is the next step, and only `vfs.cpp` would need a
+  bridge.
+
+---
+
+## Stages and the book
+
+| stage | built | OSTEP |
+|---|---|---|
+| 1 | the disk: one file, 4 KB blocks | ch. 36, 37, 39.7 |
+| 2 | bitmaps, `mkfs`, `dump` | 40.2, 40.5, ch. 17 |
+| 3 | inodes, direct / indirect / double-indirect blocks | 40.3 |
+| 4 | directories, path lookup | 40.4, 40.6 |
+| 5 | the public API, the open file table | ch. 39 |
+| 6 | the block cache: LRU, dirty bits, 16 shards | 40.7, ch. 22, 29.4 |
+| 7 | the write-ahead log | 42.1, 42.3 |
+| 8 | recovery, `fsck`, the crash test | 42.2, ch. 45 |
+| 9 | per-inode locks, lock order, the flusher thread | ch. 28–30, 32 |
+| 10 | benchmarks, this README | — |
