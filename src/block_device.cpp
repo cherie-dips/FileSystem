@@ -1,10 +1,13 @@
 #include "vfs/block_device.h"
+#include "vfs/fault.h"
 #include "vfs/layout.h"
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -54,15 +57,18 @@ namespace {
         }
     }
 
-    void write_full(int fd, const void* src, off_t offset) {
+    void write_full(int fd, const void* src, size_t len, off_t offset) {
+        // The crash test's kill switch. Returns at once unless it is armed.
+        fault::before_write(fd, src, len, offset);
+
         const char* buffer = static_cast<const char*>(src);
         size_t done = 0;
 
-        while (done < BLOCK_SIZE) {
+        while (done < len) {
             ssize_t n = ::pwrite(
                 fd,
                 buffer + done,
-                BLOCK_SIZE - done,
+                len - done,
                 offset + static_cast<off_t>(done)
             );
 
@@ -82,6 +88,14 @@ namespace {
     }
 
 } // anonymous namespace
+
+    void BlockDevice::write_run(uint32_t first, const uint8_t* data, uint32_t count) {
+        Block b;
+        for (uint32_t i = 0; i < count; i++) {
+            std::memcpy(b.data(), data + size_t{i} * BLOCK_SIZE, BLOCK_SIZE);
+            write_block(first + i, b);
+        }
+    }
 
     PreadDevice::PreadDevice(int fd, uint32_t blocks)
         : fd_(fd), block_count_(blocks) {
@@ -191,7 +205,15 @@ namespace {
         if (block_no >= block_count_)
             throw std::out_of_range("block number out of range");
 
-        write_full(fd_, src.data(), block_offset(block_no));
+        write_full(fd_, src.data(), BLOCK_SIZE, block_offset(block_no));
+    }
+
+    void PreadDevice::write_run(uint32_t first, const uint8_t* data, uint32_t count) {
+        // 64-bit, so first + count cannot wrap past the check.
+        if (uint64_t{first} + count > block_count_)
+            throw std::out_of_range("block number out of range");
+
+        write_full(fd_, data, size_t{count} * BLOCK_SIZE, block_offset(first));
     }
 
     void PreadDevice::sync() {
@@ -221,6 +243,59 @@ namespace {
     PreadDevice::~PreadDevice() {
         if (fd_ >= 0)
             ::close(fd_);
+    }
+
+    InstrumentedDevice::InstrumentedDevice(
+        BlockDevice& inner,
+        uint32_t latency_us,
+        bool sync_enabled
+    )
+        : inner_(inner), latency_us_(latency_us), sync_enabled_(sync_enabled) {
+    }
+
+    void InstrumentedDevice::delay() const {
+        if (latency_us_ > 0)
+            std::this_thread::sleep_for(std::chrono::microseconds(latency_us_));
+    }
+
+    void InstrumentedDevice::read_block(uint32_t block_no, Block& dst) {
+        delay();
+        inner_.read_block(block_no, dst);
+        reads_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void InstrumentedDevice::write_block(uint32_t block_no, const Block& src) {
+        delay();
+        inner_.write_block(block_no, src);
+        writes_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void InstrumentedDevice::write_run(uint32_t first, const uint8_t* data, uint32_t count) {
+        delay();
+        inner_.write_run(first, data, count);
+        writes_.fetch_add(count, std::memory_order_relaxed);
+    }
+
+    void InstrumentedDevice::sync() {
+        if (sync_enabled_)
+            inner_.sync();
+    }
+
+    uint32_t InstrumentedDevice::block_count() const {
+        return inner_.block_count();
+    }
+
+    uint64_t InstrumentedDevice::reads() const {
+        return reads_.load(std::memory_order_relaxed);
+    }
+
+    uint64_t InstrumentedDevice::writes() const {
+        return writes_.load(std::memory_order_relaxed);
+    }
+
+    void InstrumentedDevice::reset_counts() {
+        reads_.store(0, std::memory_order_relaxed);
+        writes_.store(0, std::memory_order_relaxed);
     }
 
 } // namespace vfs

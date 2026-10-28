@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 
 #include "vfs/layout.h"
@@ -12,6 +13,11 @@ namespace vfs {
             virtual void read_block(uint32_t block_no, Block& dst) = 0;  
 
             virtual void write_block(uint32_t block_no, const Block& src) = 0; 
+
+            // Writes count consecutive blocks, first onwards, from data
+            // (count * BLOCK_SIZE bytes). The default writes them one at a
+            // time; a device that can move them in one I/O overrides it.
+            virtual void write_run(uint32_t first, const uint8_t* data, uint32_t count);
 
             virtual void sync() = 0; 
 
@@ -43,8 +49,39 @@ namespace vfs {
 
             void read_block(uint32_t block_no, Block& dst) override;
             void write_block(uint32_t block_no, const Block& src) override; 
+            void write_run(uint32_t first, const uint8_t* data, uint32_t count) override;
             void sync() override; 
 
             uint32_t block_count() const override; 
     }; 
+
+    // Wraps another device. Counts every block read and write; can sleep
+    // before each I/O, standing in for a real disk's seek and rotation (OSTEP
+    // 37.4) so that what the cache saves is measurable - once per call, so a
+    // run of neighbouring blocks pays one seek, as on a real disk; and can
+    // turn sync() into a no-op, for runs that never need to survive a power
+    // cut.
+    class InstrumentedDevice : public BlockDevice {
+        public:
+            InstrumentedDevice(BlockDevice& inner, uint32_t latency_us, bool sync_enabled);
+
+            void read_block(uint32_t block_no, Block& dst) override;
+            void write_block(uint32_t block_no, const Block& src) override;
+            void write_run(uint32_t first, const uint8_t* data, uint32_t count) override;
+            void sync() override;
+            uint32_t block_count() const override;
+
+            uint64_t reads() const;
+            uint64_t writes() const;
+            void reset_counts();
+
+        private:
+            void delay() const;
+
+            BlockDevice& inner_;
+            const uint32_t latency_us_;
+            const bool sync_enabled_;
+            std::atomic<uint64_t> reads_{0};
+            std::atomic<uint64_t> writes_{0};
+    };
 }
