@@ -1,17 +1,21 @@
 // vfs_shell — the program you drive the file system with.
 //
-// Every command is listed with the stage that makes it work, so running --help
-// tells you where the build is. A command that works has a function to run;
-// the rest say which stage they are waiting for.
+// Every command names the disk image first. Commands that work on files mount
+// the image (its write-ahead log lives next to it, in <image>.log), do one
+// thing, and unmount - so a crash at any point leaves an image the next
+// command recovers.
 
 
 #include "vfs/bitmap.h"
 #include "vfs/block_device.h"
+#include "vfs/fsck.h"
 #include "vfs/layout.h"
 #include "vfs/mkfs.h"
 #include "vfs/superblock.h"
 #include "vfs/version.h"
+#include "vfs/vfs.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cinttypes>
 #include <cstdio>
@@ -153,6 +157,44 @@ void print_runs(const vfs::Bitmap& bm) {
     std::printf("%s\n", any ? line.c_str() : "  (none)");
 }
 
+// ------------------------------------------------------------- mounting
+
+std::string log_path(const char* image) {
+    return std::string(image) + ".log";
+}
+
+// Turns a negative return from the API into an exception main prints.
+long long must(long long rc) {
+    if (rc < 0)
+        throw std::runtime_error(vfs_strerror(static_cast<int>(rc)));
+    return rc;
+}
+
+// Mounts an image for one command. unmount() reports a failed final commit;
+// the destructor only cleans up after an error.
+class Mounted {
+public:
+    explicit Mounted(const char* image) {
+        int rc = vfs_mount(image, log_path(image).c_str(), nullptr);
+        if (rc < 0)
+            throw std::runtime_error(std::string("cannot mount ") + image + ": "
+                                     + vfs_strerror(rc));
+    }
+    ~Mounted() {
+        if (mounted_)
+            vfs_unmount();
+    }
+    void unmount() {
+        mounted_ = false;
+        must(vfs_unmount());
+    }
+    Mounted(const Mounted&) = delete;
+    Mounted& operator=(const Mounted&) = delete;
+
+private:
+    bool mounted_ = true;
+};
+
 // ---------------------------------------------------------------------- mkfs
 
 int cmd_mkfs(int argc, char** argv) {
@@ -200,6 +242,10 @@ int cmd_mkfs(int argc, char** argv) {
         std::remove(path);
         throw;
     }
+
+    // A log left over from an image that used to live at this path would
+    // otherwise be replayed onto the new one.
+    std::remove(log_path(path).c_str());
 
     std::printf("formatted %s\n", path);
     std::printf("  size         %s, %u blocks of %u bytes\n",
@@ -355,47 +401,208 @@ int cmd_dump(int argc, char** argv) {
     return status;
 }
 
+// ------------------------------------------------------- file commands
+
+int cmd_mkdir(int argc, char** argv) {
+    bool parents = false;
+    std::vector<const char*> args;
+    for (int i = 0; i < argc; i++) {
+        if (std::strcmp(argv[i], "-p") == 0)
+            parents = true;
+        else
+            args.push_back(argv[i]);
+    }
+    if (args.size() != 2)
+        throw UsageError("needs an image and a path");
+
+    Mounted m(args[0]);
+    std::string path = args[1];
+    if (!parents) {
+        must(vfs_mkdir(path.c_str()));
+    } else {
+        // Each prefix in turn; one that already exists is fine.
+        for (size_t at = 1; at <= path.size(); at++) {
+            if (at < path.size() && path[at] != '/')
+                continue;
+            std::string prefix = path.substr(0, at);
+            int rc = vfs_mkdir(prefix.c_str());
+            if (rc == -VFS_EEXIST) {
+                VfsStat st;
+                must(vfs_stat(prefix.c_str(), &st));
+                if ((st.mode & vfs::MODE_TYPE_MASK) != vfs::MODE_DIR)
+                    throw std::runtime_error(prefix + ": " + vfs_strerror(VFS_ENOTDIR));
+                continue;
+            }
+            must(rc);
+        }
+    }
+    m.unmount();
+    return 0;
+}
+
+int cmd_ls(int argc, char** argv) {
+    if (argc < 1 || argc > 2)
+        throw UsageError("needs an image, and optionally a path");
+    const char* path = argc == 2 ? argv[1] : "/";
+
+    Mounted m(argv[0]);
+    VfsStat st;
+    must(vfs_stat(path, &st));
+    if ((st.mode & vfs::MODE_TYPE_MASK) != vfs::MODE_DIR) {
+        std::printf("%s\n", path);
+    } else {
+        int total = static_cast<int>(must(vfs_readdir(path, nullptr, 0)));
+        std::vector<VfsDirEnt> entries(static_cast<size_t>(total));
+        int got = static_cast<int>(must(vfs_readdir(path, entries.data(), entries.size())));
+        entries.resize(static_cast<size_t>(std::min(got, total)));
+
+        std::sort(entries.begin(), entries.end(), [](const VfsDirEnt& a, const VfsDirEnt& b) {
+            return std::strcmp(a.name, b.name) < 0;
+        });
+        for (const VfsDirEnt& e : entries) {
+            if (std::strcmp(e.name, ".") == 0 || std::strcmp(e.name, "..") == 0)
+                continue;
+            std::printf("%s%s\n", e.name, e.type == vfs::FT_DIR ? "/" : "");
+        }
+    }
+    m.unmount();
+    return 0;
+}
+
+int cmd_cat(int argc, char** argv) {
+    if (argc != 2)
+        throw UsageError("needs an image and a path");
+
+    Mounted m(argv[0]);
+    int fd = static_cast<int>(must(vfs_open(argv[1], VFS_O_RDONLY)));
+    std::vector<char> buf(64 * 1024);
+    while (true) {
+        ssize_t n = vfs_read(fd, buf.data(), buf.size());
+        must(n);
+        if (n == 0)
+            break;
+        std::fwrite(buf.data(), 1, static_cast<size_t>(n), stdout);
+    }
+    must(vfs_close(fd));
+    m.unmount();
+    return 0;
+}
+
+int cmd_write(int argc, char** argv) {
+    if (argc < 3)
+        throw UsageError("needs an image, a path and some text");
+
+    std::string text;
+    for (int i = 2; i < argc; i++) {
+        if (i > 2)
+            text += ' ';
+        text += argv[i];
+    }
+    text += '\n';
+
+    Mounted m(argv[0]);
+    int fd = static_cast<int>(must(vfs_open(argv[1], VFS_O_WRONLY | VFS_O_CREAT | VFS_O_TRUNC)));
+    size_t done = 0;
+    while (done < text.size()) {
+        ssize_t n = vfs_write(fd, text.data() + done, text.size() - done);
+        must(n);
+        done += static_cast<size_t>(n);
+    }
+    must(vfs_close(fd));
+    m.unmount();
+    return 0;
+}
+
+int cmd_rm(int argc, char** argv) {
+    if (argc != 2)
+        throw UsageError("needs an image and a path");
+
+    Mounted m(argv[0]);
+    VfsStat st;
+    must(vfs_stat(argv[1], &st));
+    if ((st.mode & vfs::MODE_TYPE_MASK) == vfs::MODE_DIR)
+        must(vfs_rmdir(argv[1]));
+    else
+        must(vfs_unlink(argv[1]));
+    m.unmount();
+    return 0;
+}
+
+int cmd_sync(int argc, char** argv) {
+    if (argc != 1)
+        throw UsageError("needs an image");
+
+    Mounted m(argv[0]);
+    VfsStats stats;
+    vfs_get_stats(&stats);
+    if (stats.recovered_txns > 0)
+        std::printf("%s: replayed %" PRIu64 " transaction%s (%" PRIu64 " blocks) from %s\n",
+                    argv[0], stats.recovered_txns, stats.recovered_txns == 1 ? "" : "s",
+                    stats.recovered_blocks, log_path(argv[0]).c_str());
+    else
+        std::printf("%s: nothing to replay\n", argv[0]);
+
+    must(vfs_sync());
+    m.unmount();
+    std::printf("%s: everything written back, log empty\n", argv[0]);
+    return 0;
+}
+
+int cmd_fsck(int argc, char** argv) {
+    if (argc != 1)
+        throw UsageError("needs an image");
+
+    // Mounting replays the log if the image was not unmounted cleanly, so the
+    // check sees what a crash actually left committed.
+    {
+        Mounted m(argv[0]);
+        m.unmount();
+    }
+
+    vfs::PreadDevice dev = vfs::PreadDevice::open(argv[0]);
+    vfs::FsckReport r = vfs::fsck(dev);
+    for (const std::string& p : r.problems)
+        std::printf("  %s\n", p.c_str());
+
+    if (r.ok()) {
+        std::printf("%s: clean (files %u, directories %u, inodes in use %u, blocks in use %u)\n",
+                    argv[0], r.files, r.directories, r.inodes_used, r.blocks_used);
+        return 0;
+    }
+    std::printf("%s: %zu problem%s\n", argv[0], r.problems.size(),
+                r.problems.size() == 1 ? "" : "s");
+    return 1;
+}
+
 // ------------------------------------------------------------------ commands
 
 struct Command {
     const char* name;
-    const char* help;
-    const char* stage;                  // the stage that makes it work
-    int (*run)(int argc, char** argv);  // gets the arguments after the name;
-                                        // nullptr until its stage lands
     const char* args;                   // for the usage line
+    const char* help;
+    int (*run)(int argc, char** argv);  // gets the arguments after the name
 };
 
-// Kept in the order the build plan implements them.
 constexpr Command kCommands[] = {
-    {"mkfs",  "format a new disk image",             "stage 2", cmd_mkfs,
-              "<image> <size> [--inodes N]"},
-    {"dump",  "print a superblock, bitmap or inode", "stage 2", cmd_dump,
-              "<image> [--super] [--bitmaps] [--inode N]..."},
-    {"mkdir", "create a directory",                  "stage 4", nullptr, nullptr},
-    {"ls",    "list a directory",                    "stage 4", nullptr, nullptr},
-    {"cat",   "print a file",                        "stage 5", nullptr, nullptr},
-    {"write", "write text into a file",              "stage 5", nullptr, nullptr},
-    {"rm",    "remove a file",                       "stage 5", nullptr, nullptr},
-    {"sync",  "flush everything to the disk image",  "stage 6", nullptr, nullptr},
-    {"fsck",  "check the disk image for damage",     "stage 8", nullptr, nullptr},
+    {"mkfs",  "<image> <size> [--inodes N]",                  "format a new disk image",                 cmd_mkfs},
+    {"dump",  "<image> [--super] [--bitmaps] [--inode N]...", "print the superblock, bitmaps or an inode", cmd_dump},
+    {"mkdir", "<image> [-p] <path>",                          "create a directory",                      cmd_mkdir},
+    {"ls",    "<image> [path]",                               "list a directory",                        cmd_ls},
+    {"cat",   "<image> <path>",                               "print a file",                            cmd_cat},
+    {"write", "<image> <path> <text>...",                     "write text into a file, replacing it",    cmd_write},
+    {"rm",    "<image> <path>",                               "remove a file or an empty directory",     cmd_rm},
+    {"sync",  "<image>",                                      "replay the log if needed, write it all back", cmd_sync},
+    {"fsck",  "<image>",                                      "check the image for damage",              cmd_fsck},
 };
 
 void print_usage() {
     std::printf("%s\n\n", vfs::version_string().c_str());
-    std::printf("usage: vfs_shell [--version] [--help] <command> [args]\n\n");
+    std::printf("usage: vfs_shell [--version] [--help] <command> <image> [args]\n\n");
     std::printf("commands:\n");
-    for (const Command& c : kCommands) {
-        std::printf("  %-8s %-36s %s\n",
-                    c.name, c.help, c.run ? "ready" : c.stage);
-    }
-
-    std::printf("\nthe ones that are ready:\n");
-    for (const Command& c : kCommands) {
-        if (c.run)
-            std::printf("  vfs_shell %s %s\n", c.name, c.args);
-    }
+    for (const Command& c : kCommands)
+        std::printf("  %-5s  %-46s %s\n", c.name, c.args, c.help);
     std::printf("\nsizes are in bytes, or end in K, M or G: 256M\n");
+    std::printf("each image's write-ahead log lives next to it, in <image>.log\n");
 }
 
 } // namespace
@@ -421,13 +628,6 @@ int main(int argc, char** argv) {
     for (const Command& c : kCommands) {
         if (std::strcmp(arg, c.name) != 0)
             continue;
-
-        if (c.run == nullptr) {
-            std::fprintf(stderr,
-                         "vfs_shell: '%s' is not built yet - it arrives at %s\n",
-                         c.name, c.stage);
-            return 1;
-        }
 
         try {
             return c.run(argc - 2, argv + 2);
