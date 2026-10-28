@@ -119,6 +119,45 @@ namespace vfs {
                   std::has_unique_object_representations_v<DirEntry>,
                   "on-disk structs must not contain padding");
 
+    constexpr uint32_t MAX_NAME_LEN   = sizeof(DirEntry::name);          // 58
+    constexpr uint32_t PTRS_PER_BLOCK = BLOCK_SIZE / sizeof(uint32_t);   // 1024
+    constexpr uint64_t MAX_FILE_BLOCKS =
+        DIRECT_PTRS + PTRS_PER_BLOCK + uint64_t{PTRS_PER_BLOCK} * PTRS_PER_BLOCK;
+
+    constexpr uint16_t FILE_PERM = 0644;
+    constexpr uint16_t DIR_PERM  = 0755;
+
+    // What a consistent image looks like. src/vfs.cpp keeps every rule true
+    // after every operation; src/fsck.cpp checks every one of them.
+    //
+    //  - Inode N is in use iff bit N of the inode bitmap is set. Inode 0 is
+    //    always set and never used. An inode not in use is all zeros. One in
+    //    use has id == N, mode MODE_FILE | FILE_PERM or MODE_DIR | DIR_PERM,
+    //    and link_count >= 1.
+    //  - link_count is the number of directory entries, anywhere, holding that
+    //    inode number, "." and ".." included. A file has 1 (no hard links); a
+    //    directory has 2 + its number of subdirectories - the root too, since
+    //    its ".." points at itself.
+    //  - block_count is every block the inode owns: data blocks plus indirect
+    //    blocks (single, double, and the double's second level).
+    //  - A block pointer is 0 (a hole) or in [data_start, total_blocks). File
+    //    block i is direct[i] for i < 12, entry i - 12 of the single-indirect
+    //    block for i < 12 + 1024, and in the double-indirect tree after that.
+    //    An indirect block is allocated when first needed and freed only with
+    //    the rest of the file (unlink, or O_TRUNC).
+    //  - A file owns no block at or past file block ceil(size / BLOCK_SIZE).
+    //    Holes before that are allowed and read as zeros.
+    //  - A directory's size is a whole number of blocks, with no holes. Its
+    //    first block starts with "." (itself) then ".." (its parent; the
+    //    root's is itself). Entries with inode_id 0 are free and all zeros.
+    //    Every other entry has 1 <= name_len <= MAX_NAME_LEN, no '/' or NUL in
+    //    the name, a type (FT_FILE / FT_DIR) matching the inode it names, and
+    //    a name no other entry in that directory has.
+    //  - Every inode in use is reachable from the root. A directory is named
+    //    by exactly one entry besides its own "." and its children's "..".
+    //  - Bit B of the data bitmap is set iff B < data_start or exactly one
+    //    inode in use owns block B. No block is owned twice.
+
     // Where inode `id` lives: which block of the inode table, and how far into it.
     inline uint32_t inode_block(const Superblock& sb, uint32_t id) {
         return sb.inode_table_start + id / INODES_PER_BLOCK;

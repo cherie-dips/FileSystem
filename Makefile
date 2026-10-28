@@ -5,6 +5,8 @@
 #   make asan       + AddressSanitizer and UBSan          -> build/asan/
 #   make tsan       + ThreadSanitizer (needed from stage 9) -> build/tsan/
 #   make run        build and run the shell
+#   make test       build, then run every test program
+#   make bench      build, then run the benchmarks
 #   make clean      delete every build directory
 #
 # Each mode builds into its own directory, so switching between them never leaves stale object files behind.
@@ -36,7 +38,8 @@ endif
 CXXFLAGS  = -std=c++17 -Wall -Wextra -Wpedantic -Iinclude $(OPT) $(SAN) -MMD -MP
 LDFLAGS   = $(SAN)
 
-BUILD := build/$(MODE)
+# Overridable, so parallel builds can each have their own directory.
+BUILD ?= build/$(MODE)
 OBJDIR := $(BUILD)/obj
 
 LIB_SRCS  := $(wildcard src/*.cpp)
@@ -48,7 +51,7 @@ TOOLS     := $(patsubst tools/%.cpp,$(BUILD)/%,$(TOOL_SRCS))
 
 DEPS := $(LIB_OBJS:.o=.d) $(TOOL_OBJS:.o=.d)
 
-.PHONY: all debug asan tsan run clean help
+.PHONY: all debug asan tsan run test bench clean help
 .DEFAULT_GOAL := all
 
 # Without this, make treats the .o files as intermediate and deletes them after
@@ -78,10 +81,18 @@ tsan:
 run: all
 	@./$(BUILD)/vfs_shell
 
+# Every tool whose name ends in "test" is a test program.
+test: all
+	@set -e; for t in $(filter %test,$(TOOLS)); do echo "== $$t"; ./$$t; done
+	@echo "all tests passed ($(MODE))"
+
+bench: all
+	@./$(BUILD)/bench
+
 clean:
 	rm -rf build
 
 help:
-	@sed -n '3,10p' Makefile
+	@sed -n '3,12p' Makefile
 
 -include $(DEPS)
